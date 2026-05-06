@@ -1,10 +1,15 @@
 package com.example.toothtimer
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -35,6 +40,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -68,7 +74,8 @@ data class CleaningStepConfig(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val durationSec: Int,
-    val zoneType: ZoneType = ZoneType.CUSTOM
+    val zoneType: ZoneType = ZoneType.CUSTOM,
+    val audioCueUri: String? = null
 )
 
 enum class ZoneType {
@@ -285,10 +292,44 @@ fun CleaningScreen(
     var isPaused by remember { mutableStateOf(false) }
     var elapsedSec by remember { mutableIntStateOf(0) }
     var showExitDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+
+    fun stopAudioCue() {
+        mediaPlayer?.runCatching {
+            stop()
+            release()
+        }
+        mediaPlayer = null
+    }
 
     val currentStep = steps[stepIndex]
     val totalDuration = steps.sumOf { it.durationSec } + pauseBetweenZonesSec * (steps.size - 1)
     val progress = if (totalDuration > 0) elapsedSec.toFloat() / totalDuration.toFloat() else 0f
+
+    LaunchedEffect(currentStep.id, phase) {
+        stopAudioCue()
+        if (phase == CleaningPhase.STEP) {
+            val audioUri = currentStep.audioCueUri
+            if (!audioUri.isNullOrBlank()) {
+                val player = MediaPlayer()
+                mediaPlayer = runCatching {
+                    player.apply {
+                        setDataSource(context, Uri.parse(audioUri))
+                        prepare()
+                        start()
+                    }
+                }.getOrElse {
+                    player.release()
+                    null
+                }
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { stopAudioCue() }
+    }
 
     LaunchedEffect(phase, stepIndex, isPaused) {
         if (isPaused) return@LaunchedEffect
@@ -554,8 +595,24 @@ fun SettingsScreen(
     onPauseChanged: (Int) -> Unit,
     onResetDefaults: () -> Unit
 ) {
+    val context = LocalContext.current
     var currentPause by remember { mutableIntStateOf(pauseSec) }
     var showResetDialog by remember { mutableStateOf(false) }
+    var audioPickerStepIndex by remember { mutableStateOf<Int?>(null) }
+    val audioPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val index = audioPickerStepIndex
+        audioPickerStepIndex = null
+        if (uri != null && index != null && index in steps.indices) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            steps[index] = steps[index].copy(audioCueUri = uri.toString())
+            onStepsChanged()
+        }
+    }
 
     if (showResetDialog) {
         AlertDialog(
@@ -645,6 +702,14 @@ fun SettingsScreen(
                         steps[index] = step.copy(durationSec = newDuration)
                         onStepsChanged()
                     },
+                    onSelectAudioCue = {
+                        audioPickerStepIndex = index
+                        audioPickerLauncher.launch(arrayOf("audio/*"))
+                    },
+                    onRemoveAudioCue = {
+                        steps[index] = step.copy(audioCueUri = null)
+                        onStepsChanged()
+                    },
                     onMoveUp = {
                         if (index > 0) {
                             val item = steps.removeAt(index)
@@ -713,6 +778,8 @@ fun StepSettingsCard(
     step: CleaningStepConfig,
     onTitleChange: (String) -> Unit,
     onDurationChange: (Int) -> Unit,
+    onSelectAudioCue: () -> Unit,
+    onRemoveAudioCue: () -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onDelete: () -> Unit
@@ -750,6 +817,14 @@ fun StepSettingsCard(
                 onChange = onDurationChange
             )
 
+            Spacer(Modifier.height(10.dp))
+
+            AudioCueControls(
+                hasAudioCue = !step.audioCueUri.isNullOrBlank(),
+                onSelectAudioCue = onSelectAudioCue,
+                onRemoveAudioCue = onRemoveAudioCue
+            )
+
             Spacer(Modifier.height(8.dp))
 
             Row(
@@ -759,6 +834,40 @@ fun StepSettingsCard(
                 TextButton(onClick = onMoveUp, enabled = index > 0) { Text("↑ Выше") }
                 TextButton(onClick = onMoveDown, enabled = index < total - 1) { Text("↓ Ниже") }
                 TextButton(onClick = onDelete, enabled = total > 1) { Text("Удалить", color = Color(0xFFD32F2F)) }
+            }
+        }
+    }
+}
+
+
+@Composable
+fun AudioCueControls(
+    hasAudioCue: Boolean,
+    onSelectAudioCue: () -> Unit,
+    onRemoveAudioCue: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color.White, RoundedCornerShape(12.dp))
+            .padding(12.dp)
+    ) {
+        Text("Озвучка зоны", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = onSelectAudioCue,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Выбрать озвучку")
+        }
+        if (hasAudioCue) {
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onRemoveAudioCue,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFD32F2F))
+            ) {
+                Text("Удалить озвучку")
             }
         }
     }
@@ -984,6 +1093,11 @@ fun formatDuration(seconds: Int): String {
     return if (minutes > 0) "${minutes} мин ${sec} сек" else "${sec} сек"
 }
 
+fun JSONObject.optNullableString(name: String): String? {
+    if (!has(name) || isNull(name)) return null
+    return optString(name).takeIf { it.isNotBlank() }
+}
+
 class AppStorage(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("tooth_timer", Context.MODE_PRIVATE)
 
@@ -997,7 +1111,8 @@ class AppStorage(context: Context) {
                     id = obj.optString("id", UUID.randomUUID().toString()),
                     title = obj.getString("title"),
                     durationSec = obj.getInt("durationSec"),
-                    zoneType = runCatching { ZoneType.valueOf(obj.optString("zoneType", "CUSTOM")) }.getOrDefault(ZoneType.CUSTOM)
+                    zoneType = runCatching { ZoneType.valueOf(obj.optString("zoneType", "CUSTOM")) }.getOrDefault(ZoneType.CUSTOM),
+                    audioCueUri = obj.optNullableString("audioCueUri")
                 )
             }.ifEmpty { defaultSteps() }
         }.getOrDefault(defaultSteps())
@@ -1012,6 +1127,7 @@ class AppStorage(context: Context) {
                     .put("title", step.title)
                     .put("durationSec", step.durationSec)
                     .put("zoneType", step.zoneType.name)
+                    .put("audioCueUri", step.audioCueUri)
             )
         }
         prefs.edit().putString("steps", array.toString()).apply()
