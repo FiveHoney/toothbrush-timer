@@ -12,6 +12,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,6 +35,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -69,12 +72,15 @@ import java.util.UUID
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.max
+import kotlin.math.min
 
 data class CleaningStepConfig(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val durationSec: Int,
     val zoneType: ZoneType = ZoneType.CUSTOM,
+    val diagramType: ZoneDiagramType = ZoneDiagramType.fromZoneType(zoneType),
     val audioCueUri: String? = null
 )
 
@@ -91,6 +97,40 @@ enum class ZoneType {
     FRONT_BOTTOM,
     CUSTOM
 }
+
+enum class ZoneDiagramType(val label: String) {
+    CHEW_TOP_RIGHT("Жевательная поверхность — верх справа"),
+    CHEW_TOP_LEFT("Жевательная поверхность — верх слева"),
+    CHEW_BOTTOM_RIGHT("Жевательная поверхность — низ справа"),
+    CHEW_BOTTOM_LEFT("Жевательная поверхность — низ слева"),
+    OUTER_TOP_RIGHT("Внешняя боковая поверхность — верх справа"),
+    OUTER_TOP_LEFT("Внешняя боковая поверхность — верх слева"),
+    OUTER_BOTTOM_RIGHT("Внешняя боковая поверхность — низ справа"),
+    OUTER_BOTTOM_LEFT("Внешняя боковая поверхность — низ слева"),
+    FRONT_TOP("Передние зубы — сверху"),
+    FRONT_BOTTOM("Передние зубы — снизу"),
+    UNIVERSAL("Универсальная зона / без схемы");
+
+    companion object {
+        fun fromZoneType(zoneType: ZoneType): ZoneDiagramType = when (zoneType) {
+            ZoneType.CHEW_TOP_RIGHT -> CHEW_TOP_RIGHT
+            ZoneType.CHEW_TOP_LEFT -> CHEW_TOP_LEFT
+            ZoneType.CHEW_BOTTOM_RIGHT -> CHEW_BOTTOM_RIGHT
+            ZoneType.CHEW_BOTTOM_LEFT -> CHEW_BOTTOM_LEFT
+            ZoneType.OUTER_TOP_RIGHT -> OUTER_TOP_RIGHT
+            ZoneType.OUTER_TOP_LEFT -> OUTER_TOP_LEFT
+            ZoneType.OUTER_BOTTOM_RIGHT -> OUTER_BOTTOM_RIGHT
+            ZoneType.OUTER_BOTTOM_LEFT -> OUTER_BOTTOM_LEFT
+            ZoneType.FRONT_TOP -> FRONT_TOP
+            ZoneType.FRONT_BOTTOM -> FRONT_BOTTOM
+            ZoneType.CUSTOM -> UNIVERSAL
+        }
+
+        fun fromStoredName(name: String?, fallbackZoneType: ZoneType): ZoneDiagramType =
+            runCatching { valueOf(name.orEmpty()) }.getOrDefault(fromZoneType(fallbackZoneType))
+    }
+}
+
 
 data class CleaningHistoryItem(
     val startedAtMillis: Long,
@@ -440,8 +480,8 @@ fun CleaningScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(18.dp))
-            TeethMap(
-                activeZone = currentStep.zoneType,
+            ToothZoneDiagram(
+                diagramType = currentStep.diagramType,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(230.dp)
@@ -702,6 +742,10 @@ fun SettingsScreen(
                         steps[index] = step.copy(durationSec = newDuration)
                         onStepsChanged()
                     },
+                    onDiagramChange = { newDiagram ->
+                        steps[index] = step.copy(diagramType = newDiagram)
+                        onStepsChanged()
+                    },
                     onSelectAudioCue = {
                         audioPickerStepIndex = index
                         audioPickerLauncher.launch(arrayOf("audio/*"))
@@ -740,7 +784,8 @@ fun SettingsScreen(
                             CleaningStepConfig(
                                 title = "Новая зона",
                                 durationSec = 10,
-                                zoneType = ZoneType.CUSTOM
+                                zoneType = ZoneType.CUSTOM,
+                                diagramType = ZoneDiagramType.UNIVERSAL
                             )
                         )
                         onStepsChanged()
@@ -778,6 +823,7 @@ fun StepSettingsCard(
     step: CleaningStepConfig,
     onTitleChange: (String) -> Unit,
     onDurationChange: (Int) -> Unit,
+    onDiagramChange: (ZoneDiagramType) -> Unit,
     onSelectAudioCue: () -> Unit,
     onRemoveAudioCue: () -> Unit,
     onMoveUp: () -> Unit,
@@ -819,6 +865,13 @@ fun StepSettingsCard(
 
             Spacer(Modifier.height(10.dp))
 
+            DiagramSelector(
+                selected = step.diagramType,
+                onSelected = onDiagramChange
+            )
+
+            Spacer(Modifier.height(10.dp))
+
             AudioCueControls(
                 hasAudioCue = !step.audioCueUri.isNullOrBlank(),
                 onSelectAudioCue = onSelectAudioCue,
@@ -836,6 +889,78 @@ fun StepSettingsCard(
                 TextButton(onClick = onDelete, enabled = total > 1) { Text("Удалить", color = Color(0xFFD32F2F)) }
             }
         }
+    }
+}
+
+
+@Composable
+fun DiagramSelector(
+    selected: ZoneDiagramType,
+    onSelected: (ZoneDiagramType) -> Unit
+) {
+    var showDialog by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color.White, RoundedCornerShape(12.dp))
+            .padding(12.dp)
+    ) {
+        Text("Схема зоны", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        Text(selected.label, color = Color.DarkGray, fontSize = 14.sp)
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { showDialog = true },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Выбрать схему")
+        }
+    }
+
+    if (showDialog) {
+        AlertDialog(
+            onDismissRequest = { showDialog = false },
+            title = { Text("Схема зоны") },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    ZoneDiagramType.entries.forEach { diagram ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = diagram == selected,
+                                onClick = {
+                                    onSelected(diagram)
+                                    showDialog = false
+                                }
+                            )
+                            TextButton(
+                                onClick = {
+                                    onSelected(diagram)
+                                    showDialog = false
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = diagram.label,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    textAlign = TextAlign.Start
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDialog = false }) {
+                    Text("Закрыть")
+                }
+            }
+        )
     }
 }
 
@@ -968,65 +1093,155 @@ fun ToothIcon(modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun TeethMap(activeZone: ZoneType, modifier: Modifier = Modifier) {
+fun ToothZoneDiagram(diagramType: ZoneDiagramType, modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
         val blue = Color(0xFF5A9BE8)
-        val gray = Color(0xFF222222)
-        val inactive = Color.White
+        val blueDark = Color(0xFF2F76D2)
+        val outline = Color(0xFF777777)
+        val inactive = Color(0xFFF8F8F8)
+        val gum = Color(0xFFFFE9E9)
         val center = Offset(size.width / 2f, size.height / 2f)
-        val radiusX = size.width * 0.32f
-        val radiusY = size.height * 0.34f
+        val radiusX = size.width * 0.34f
+        val radiusY = size.height * 0.31f
         val toothRadius = size.minDimension * 0.045f
+        val topOffset = size.height * 0.07f
+        val bottomOffset = size.height * 0.07f
 
-        val activeTop = when (activeZone) {
-            ZoneType.CHEW_TOP_RIGHT, ZoneType.OUTER_TOP_RIGHT -> setOf(0, 1, 2)
-            ZoneType.CHEW_TOP_LEFT, ZoneType.OUTER_TOP_LEFT -> setOf(7, 8, 9)
-            ZoneType.FRONT_TOP -> setOf(3, 4, 5, 6)
-            else -> emptySet()
-        }
-        val activeBottom = when (activeZone) {
-            ZoneType.CHEW_BOTTOM_RIGHT, ZoneType.OUTER_BOTTOM_RIGHT -> setOf(0, 1, 2)
-            ZoneType.CHEW_BOTTOM_LEFT, ZoneType.OUTER_BOTTOM_LEFT -> setOf(7, 8, 9)
-            ZoneType.FRONT_BOTTOM -> setOf(3, 4, 5, 6)
+        fun activeTopIndexes(): Set<Int> = when (diagramType) {
+            ZoneDiagramType.CHEW_TOP_RIGHT, ZoneDiagramType.OUTER_TOP_RIGHT -> setOf(7, 8, 9)
+            ZoneDiagramType.CHEW_TOP_LEFT, ZoneDiagramType.OUTER_TOP_LEFT -> setOf(0, 1, 2)
+            ZoneDiagramType.FRONT_TOP -> setOf(3, 4, 5, 6)
             else -> emptySet()
         }
 
-        fun drawTooth(pos: Offset, active: Boolean) {
+        fun activeBottomIndexes(): Set<Int> = when (diagramType) {
+            ZoneDiagramType.CHEW_BOTTOM_RIGHT, ZoneDiagramType.OUTER_BOTTOM_RIGHT -> setOf(7, 8, 9)
+            ZoneDiagramType.CHEW_BOTTOM_LEFT, ZoneDiagramType.OUTER_BOTTOM_LEFT -> setOf(0, 1, 2)
+            ZoneDiagramType.FRONT_BOTTOM -> setOf(3, 4, 5, 6)
+            else -> emptySet()
+        }
+
+        fun topPosition(index: Int): Offset {
+            val angle = PI + (index / 9.0) * PI
+            return Offset(
+                x = center.x + cos(angle).toFloat() * radiusX,
+                y = center.y + sin(angle).toFloat() * radiusY - topOffset
+            )
+        }
+
+        fun bottomPosition(index: Int): Offset {
+            val angle = (index / 9.0) * PI
+            return Offset(
+                x = center.x + cos(angle).toFloat() * radiusX,
+                y = center.y + sin(angle).toFloat() * radiusY + bottomOffset
+            )
+        }
+
+        fun drawTooth(pos: Offset, active: Boolean, outerSurface: Boolean) {
             drawCircle(
-                color = if (active) blue else inactive,
+                color = if (active && !outerSurface) blue else inactive,
                 radius = toothRadius,
                 center = pos
             )
             drawCircle(
-                color = gray,
+                color = outline,
                 radius = toothRadius,
                 center = pos,
                 style = Stroke(width = 2.5f)
             )
+            if (active && outerSurface) {
+                drawCircle(
+                    color = blue,
+                    radius = toothRadius * 0.58f,
+                    center = pos
+                )
+                drawCircle(
+                    color = blueDark,
+                    radius = toothRadius * 1.22f,
+                    center = pos,
+                    style = Stroke(width = 4.5f)
+                )
+            }
+        }
+
+        fun drawActiveBand(indexes: Set<Int>, top: Boolean) {
+            if (indexes.isEmpty()) return
+            val positions = indexes.map { if (top) topPosition(it) else bottomPosition(it) }
+            val minX = positions.minOf { it.x } - toothRadius * 1.7f
+            val maxX = positions.maxOf { it.x } + toothRadius * 1.7f
+            val minY = positions.minOf { it.y } - toothRadius * 1.7f
+            val maxY = positions.maxOf { it.y } + toothRadius * 1.7f
+            drawRoundRect(
+                color = blue.copy(alpha = 0.18f),
+                topLeft = Offset(minX, minY),
+                size = androidx.compose.ui.geometry.Size(maxX - minX, maxY - minY),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(toothRadius, toothRadius)
+            )
+        }
+
+        drawArc(
+            color = gum,
+            startAngle = 180f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(center.x - radiusX - toothRadius, center.y - radiusY - topOffset - toothRadius),
+            size = androidx.compose.ui.geometry.Size((radiusX + toothRadius) * 2f, (radiusY + toothRadius) * 2f),
+            style = Stroke(width = toothRadius * 2.1f)
+        )
+        drawArc(
+            color = gum,
+            startAngle = 0f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(center.x - radiusX - toothRadius, center.y - radiusY + bottomOffset - toothRadius),
+            size = androidx.compose.ui.geometry.Size((radiusX + toothRadius) * 2f, (radiusY + toothRadius) * 2f),
+            style = Stroke(width = toothRadius * 2.1f)
+        )
+
+        val activeTop = activeTopIndexes()
+        val activeBottom = activeBottomIndexes()
+        val isOuter = diagramType.name.startsWith("OUTER")
+        drawActiveBand(activeTop, top = true)
+        drawActiveBand(activeBottom, top = false)
+
+        for (i in 0 until 10) {
+            drawTooth(topPosition(i), i in activeTop, isOuter)
         }
 
         for (i in 0 until 10) {
-            val angle = PI + (i / 9.0) * PI
-            val x = center.x + cos(angle).toFloat() * radiusX
-            val y = center.y + sin(angle).toFloat() * radiusY - size.height * 0.07f
-            drawTooth(Offset(x, y), i in activeTop)
+            drawTooth(bottomPosition(i), i in activeBottom, isOuter)
         }
 
-        for (i in 0 until 10) {
-            val angle = 0.0 + (i / 9.0) * PI
-            val x = center.x + cos(angle).toFloat() * radiusX
-            val y = center.y + sin(angle).toFloat() * radiusY + size.height * 0.07f
-            drawTooth(Offset(x, y), i in activeBottom)
+        drawLine(
+            color = outline.copy(alpha = 0.5f),
+            start = Offset(size.width * 0.18f, center.y),
+            end = Offset(size.width * 0.82f, center.y),
+            strokeWidth = 2f
+        )
+
+        if (diagramType == ZoneDiagramType.UNIVERSAL) {
+            drawCircle(
+                color = blue.copy(alpha = 0.18f),
+                radius = min(size.width, size.height) * 0.24f,
+                center = center
+            )
+            drawCircle(
+                color = blueDark,
+                radius = min(size.width, size.height) * 0.24f,
+                center = center,
+                style = Stroke(width = 4f)
+            )
         }
 
+        val caption = if (diagramType == ZoneDiagramType.UNIVERSAL) "любая зона" else if (isOuter) "снаружи" else "жевать"
         drawContext.canvas.nativeCanvas.apply {
             drawText(
-                "схема зон",
+                caption,
                 center.x,
                 size.height - 12f,
                 android.graphics.Paint().apply {
                     color = android.graphics.Color.GRAY
-                    textSize = 28f
+                    textSize = max(22f, size.minDimension * 0.11f)
                     textAlign = android.graphics.Paint.Align.CENTER
                 }
             )
@@ -1038,52 +1253,62 @@ fun defaultSteps(): List<CleaningStepConfig> = listOf(
     CleaningStepConfig(
         title = "Жевательная поверхность — верх справа",
         durationSec = 20,
-        zoneType = ZoneType.CHEW_TOP_RIGHT
+        zoneType = ZoneType.CHEW_TOP_RIGHT,
+        diagramType = ZoneDiagramType.CHEW_TOP_RIGHT
     ),
     CleaningStepConfig(
         title = "Жевательная поверхность — верх слева",
         durationSec = 20,
-        zoneType = ZoneType.CHEW_TOP_LEFT
+        zoneType = ZoneType.CHEW_TOP_LEFT,
+        diagramType = ZoneDiagramType.CHEW_TOP_LEFT
     ),
     CleaningStepConfig(
         title = "Жевательная поверхность — низ справа",
         durationSec = 20,
-        zoneType = ZoneType.CHEW_BOTTOM_RIGHT
+        zoneType = ZoneType.CHEW_BOTTOM_RIGHT,
+        diagramType = ZoneDiagramType.CHEW_BOTTOM_RIGHT
     ),
     CleaningStepConfig(
         title = "Жевательная поверхность — низ слева",
         durationSec = 20,
-        zoneType = ZoneType.CHEW_BOTTOM_LEFT
+        zoneType = ZoneType.CHEW_BOTTOM_LEFT,
+        diagramType = ZoneDiagramType.CHEW_BOTTOM_LEFT
     ),
     CleaningStepConfig(
         title = "Внешняя боковая поверхность — верх справа",
         durationSec = 10,
-        zoneType = ZoneType.OUTER_TOP_RIGHT
+        zoneType = ZoneType.OUTER_TOP_RIGHT,
+        diagramType = ZoneDiagramType.OUTER_TOP_RIGHT
     ),
     CleaningStepConfig(
         title = "Внешняя боковая поверхность — верх слева",
         durationSec = 10,
-        zoneType = ZoneType.OUTER_TOP_LEFT
+        zoneType = ZoneType.OUTER_TOP_LEFT,
+        diagramType = ZoneDiagramType.OUTER_TOP_LEFT
     ),
     CleaningStepConfig(
         title = "Внешняя боковая поверхность — низ справа",
         durationSec = 10,
-        zoneType = ZoneType.OUTER_BOTTOM_RIGHT
+        zoneType = ZoneType.OUTER_BOTTOM_RIGHT,
+        diagramType = ZoneDiagramType.OUTER_BOTTOM_RIGHT
     ),
     CleaningStepConfig(
         title = "Внешняя боковая поверхность — низ слева",
         durationSec = 10,
-        zoneType = ZoneType.OUTER_BOTTOM_LEFT
+        zoneType = ZoneType.OUTER_BOTTOM_LEFT,
+        diagramType = ZoneDiagramType.OUTER_BOTTOM_LEFT
     ),
     CleaningStepConfig(
         title = "Передние зубы — сверху",
         durationSec = 15,
-        zoneType = ZoneType.FRONT_TOP
+        zoneType = ZoneType.FRONT_TOP,
+        diagramType = ZoneDiagramType.FRONT_TOP
     ),
     CleaningStepConfig(
         title = "Передние зубы — снизу",
         durationSec = 15,
-        zoneType = ZoneType.FRONT_BOTTOM
+        zoneType = ZoneType.FRONT_BOTTOM,
+        diagramType = ZoneDiagramType.FRONT_BOTTOM
     )
 )
 
@@ -1107,11 +1332,15 @@ class AppStorage(context: Context) {
             val array = JSONArray(raw)
             List(array.length()) { index ->
                 val obj = array.getJSONObject(index)
+                val zoneType = runCatching {
+                    ZoneType.valueOf(obj.optString("zoneType", "CUSTOM"))
+                }.getOrDefault(ZoneType.CUSTOM)
                 CleaningStepConfig(
                     id = obj.optString("id", UUID.randomUUID().toString()),
                     title = obj.getString("title"),
                     durationSec = obj.getInt("durationSec"),
-                    zoneType = runCatching { ZoneType.valueOf(obj.optString("zoneType", "CUSTOM")) }.getOrDefault(ZoneType.CUSTOM),
+                    zoneType = zoneType,
+                    diagramType = ZoneDiagramType.fromStoredName(obj.optNullableString("diagramType"), zoneType),
                     audioCueUri = obj.optNullableString("audioCueUri")
                 )
             }.ifEmpty { defaultSteps() }
@@ -1127,6 +1356,7 @@ class AppStorage(context: Context) {
                     .put("title", step.title)
                     .put("durationSec", step.durationSec)
                     .put("zoneType", step.zoneType.name)
+                    .put("diagramType", step.diagramType.name)
                     .put("audioCueUri", step.audioCueUri)
             )
         }
