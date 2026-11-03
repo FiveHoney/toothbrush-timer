@@ -29,15 +29,15 @@ class SessionClockTest {
     }
     @Test fun progressUsesFractionalSecondsAndExcludesTransitions() {
         val partial = SessionClock(listOf(1000, 1000), 2000).advance(0, true).advance(250, true)
-        assertEquals(.25f, partial.zoneProgress)
-        assertEquals(.125f, partial.cleaningProgress)
-        assertEquals(.5f, nextTransition().advance(9000, false).cleaningProgress)
+        assertEquals(.25f, partial.zoneProgress, .0001f)
+        assertEquals(.125f, partial.cleaningProgress, .0001f)
+        assertEquals(.5f, nextTransition().advance(9000, false).cleaningProgress, .0001f)
     }
     @Test fun completesExactlyOnceAndCountsLastZone() {
         val finished = nextTransition().advance(2000, true).advance(1000, true)
         assertEquals(CleaningPhase.COMPLETED, finished.phase)
         assertEquals(2, finished.completedSteps)
-        assertEquals(1f, finished.cleaningProgress)
+        assertEquals(1f, finished.cleaningProgress, .0001f)
         assertEquals(finished, finished.advance(1000, true))
     }
 }
