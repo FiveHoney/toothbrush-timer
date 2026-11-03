@@ -15,7 +15,7 @@ data class SessionClock(
     val zoneProgress: Float get() = (phaseElapsedMs.toFloat() / durationsMs[index]).coerceIn(0f, 1f)
     val cleaningProgress: Float get() = ((durationsMs.take(index).sum() +
         if (phase == CleaningPhase.STEP) phaseElapsedMs.coerceAtMost(durationsMs[index])
-        else if (phase == CleaningPhase.COMPLETED) durationsMs[index] else 0).toFloat() / durationsMs.sum()).coerceIn(0f, 1f)
+        else if (phase == CleaningPhase.COMPLETED) durationsMs[index] else 0L).toFloat() / durationsMs.sum()).coerceIn(0f, 1f)
 
     fun advance(deltaMs: Long, audioFinished: Boolean): SessionClock {
         if (phase == CleaningPhase.COMPLETED) return this
