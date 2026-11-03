@@ -142,6 +142,7 @@ fun ToothTimerApp() {
     val context = LocalContext.current
     val storage = remember { AppStorage(context) }
     val steps = remember { mutableStateListOf<CleaningStepConfig>().apply { addAll(storage.loadSteps()) } }
+    val pauseCues = remember { mutableStateListOf<AudioCue>().apply { addAll(storage.loadPauseCues()) } }
     val history = remember { mutableStateListOf<CleaningHistoryItem>().apply { addAll(storage.loadHistory()) } }
     var currentScreen by rememberSaveable { mutableStateOf(Screen.HOME) }
 
@@ -165,6 +166,7 @@ fun ToothTimerApp() {
                 Screen.CLEANING -> CleaningScreen(
                     steps = steps,
                     pauseBetweenZonesSec = storage.loadPauseSec(),
+                    pauseCues = pauseCues,
                     onCompleted = { durationSec ->
                         val item = CleaningHistoryItem(
                             startedAtMillis = startedAt,
@@ -207,6 +209,12 @@ fun ToothTimerApp() {
                 Screen.SETTINGS -> SettingsScreen(
                     steps = steps,
                     pauseSec = storage.loadPauseSec(),
+                    pauseCues = pauseCues,
+                    onPauseCuesChanged = { cues ->
+                        pauseCues.clear()
+                        pauseCues.addAll(cues)
+                        storage.savePauseCues(pauseCues)
+                    },
                     onBack = { currentScreen = Screen.HOME },
                     onStepsChanged = { storage.saveSteps(steps) },
                     onPauseChanged = { storage.savePauseSec(it) },
@@ -215,6 +223,8 @@ fun ToothTimerApp() {
                         steps.addAll(defaultSteps())
                         storage.saveSteps(steps)
                         storage.savePauseSec(2)
+                        pauseCues.clear()
+                        storage.savePauseCues(pauseCues)
                     }
                 )
             }
@@ -288,6 +298,7 @@ fun HomeScreen(
 fun CleaningScreen(
     steps: List<CleaningStepConfig>,
     pauseBetweenZonesSec: Int,
+    pauseCues: List<AudioCue>,
     onCompleted: (durationSec: Int) -> Unit,
     onInterrupted: (durationSec: Int, completedSteps: Int) -> Unit
 ) {
@@ -316,6 +327,10 @@ fun CleaningScreen(
     val phase = session.phase
     val stepIndex = session.index
     val currentStep = steps[stepIndex]
+    // Choose once per transition. Keep that choice through pause/resume and recreation.
+    val transitionAudioUris = rememberSaveable(stepIndex) {
+        ArrayList(transitionAudio(pauseCues, currentStep.audioCues, stepIndex).map { it.uri })
+    }
     val elapsedSec = (session.elapsedMs / 1000).toInt()
     val timeLeft = ceil(session.remainingMs / 1000.0).toInt()
     val pauseLeft = ceil((session.transitionMs - session.phaseElapsedMs).coerceAtLeast(0) / 1000.0).toInt()
@@ -341,8 +356,8 @@ fun CleaningScreen(
         if (phase == CleaningPhase.BETWEEN_STEPS) {
             audioFinished = false
             audioError = false
-            for (cue in currentStep.audioCues) {
-                if (!audio.play(cue.uri)) audioError = true
+            for (uri in transitionAudioUris) {
+                if (!audio.play(uri)) audioError = true
             }
             audioFinished = true
         }
@@ -592,6 +607,8 @@ fun HistoryCard(item: CleaningHistoryItem) {
 fun SettingsScreen(
     steps: MutableList<CleaningStepConfig>,
     pauseSec: Int,
+    pauseCues: List<AudioCue>,
+    onPauseCuesChanged: (List<AudioCue>) -> Unit,
     onBack: () -> Unit,
     onStepsChanged: () -> Unit,
     onPauseChanged: (Int) -> Unit,
@@ -600,11 +617,14 @@ fun SettingsScreen(
     val context = LocalContext.current
     var currentPause by remember { mutableIntStateOf(pauseSec) }
     var showResetDialog by remember { mutableStateOf(false) }
-    var audioPickerStepId by remember { mutableStateOf<String?>(null) }
+    var audioPickerStepId by rememberSaveable { mutableStateOf<String?>(null) }
+    var audioPickerForPause by rememberSaveable { mutableStateOf(false) }
     val audioPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val index = steps.indexOfFirst { it.id == audioPickerStepId }
+        val forPause = audioPickerForPause
         audioPickerStepId = null
-        if (index >= 0) {
+        audioPickerForPause = false
+        if (uris.isNotEmpty() && (forPause || index >= 0)) {
             val additions = uris.map { uri ->
                 runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
                 val name = runCatching {
@@ -614,8 +634,11 @@ fun SettingsScreen(
                 }.getOrNull() ?: "Аудиозапись"
                 AudioCue(uri.toString(), name)
             }
-            steps[index] = steps[index].copy(audioCues = steps[index].audioCues + additions)
-            onStepsChanged()
+            if (forPause) onPauseCuesChanged(pauseCues + additions)
+            else {
+                steps[index] = steps[index].copy(audioCues = steps[index].audioCues + additions)
+                onStepsChanged()
+            }
         }
     }
 
@@ -623,7 +646,7 @@ fun SettingsScreen(
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
             title = { Text("Сбросить настройки?") },
-            text = { Text("Список зон и пауза вернутся к значениям по умолчанию.") },
+            text = { Text("Зоны и пауза вернутся к значениям по умолчанию. Список звуков пауз будет очищен.") },
             confirmButton = {
                 TextButton(onClick = {
                     showResetDialog = false
@@ -682,6 +705,19 @@ fun SettingsScreen(
                         onPauseChanged(it)
                     }
                 )
+                AudioCueControls(
+                    cues = pauseCues,
+                    title = "Звуки пауз между зонами",
+                    description = "В начале каждой паузы случайно выбирается один звук. Он прозвучит полностью, даже если время паузы уже вышло. Затем прозвучат подсказки следующей зоны, если они заданы.",
+                    onSelectAudioCue = {
+                        audioPickerForPause = true
+                        audioPickerStepId = null
+                        audioPickerLauncher.launch(arrayOf("audio/*"))
+                    },
+                    onRemoveAudioCue = { cueIndex ->
+                        onPauseCuesChanged(pauseCues.filterIndexed { index, _ -> index != cueIndex })
+                    }
+                )
             }
 
             item {
@@ -713,6 +749,7 @@ fun SettingsScreen(
                         onStepsChanged()
                     },
                     onSelectAudioCue = {
+                        audioPickerForPause = false
                         audioPickerStepId = step.id
                         audioPickerLauncher.launch(arrayOf("audio/*"))
                     },
@@ -771,7 +808,7 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(28.dp))
                 Text(
-                    "Версия 1.1.0",
+                    "Версия 1.2.0",
                     modifier = Modifier.fillMaxWidth(),
                     textAlign = TextAlign.Center,
                     color = Color.Gray
@@ -853,10 +890,16 @@ fun StepSettingsCard(
 
 
 @Composable
-fun AudioCueControls(cues: List<AudioCue>, onSelectAudioCue: () -> Unit, onRemoveAudioCue: (Int) -> Unit) {
+fun AudioCueControls(
+    cues: List<AudioCue>,
+    onSelectAudioCue: () -> Unit,
+    onRemoveAudioCue: (Int) -> Unit,
+    title: String = "Озвучка перехода к этой зоне",
+    description: String = "Записи звучат по очереди после случайного звука паузы. Чистка начнётся после всех записей и паузы."
+) {
     Column(Modifier.fillMaxWidth().padding(12.dp)) {
-        Text("Озвучка перехода к этой зоне", fontWeight = FontWeight.Bold)
-        Text("Записи звучат по очереди. Чистка начнётся после всех записей и паузы.", fontSize = 14.sp)
+        Text(title, fontWeight = FontWeight.Bold)
+        Text(description, fontSize = 14.sp)
         cues.forEachIndexed { index, cue ->
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("${index + 1}. ${cue.name}", modifier = Modifier.weight(1f))
@@ -1084,6 +1127,23 @@ class AppStorage(context: Context) {
         prefs.edit().putString("steps", array.toString()).apply()
     }
 
+    fun loadPauseCues(): List<AudioCue> {
+        val raw = prefs.getString("pauseAudioCues", null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            List(array.length()) { index ->
+                val cue = array.getJSONObject(index)
+                AudioCue(cue.getString("uri"), cue.optString("name", "Аудиозапись"))
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun savePauseCues(cues: List<AudioCue>) {
+        val array = JSONArray()
+        cues.forEach { array.put(JSONObject().put("uri", it.uri).put("name", it.name)) }
+        prefs.edit().putString("pauseAudioCues", array.toString()).apply()
+    }
+
     fun loadPauseSec(): Int = prefs.getInt("pauseSec", 2).coerceIn(0, 30)
 
     fun savePauseSec(value: Int) {
@@ -1098,7 +1158,7 @@ class AppStorage(context: Context) {
                 val obj = array.getJSONObject(index)
                 CleaningHistoryItem(
                     startedAtMillis = obj.getLong("startedAtMillis"),
-                    durationSec = obj.getInt("durationSec").coerceIn(5, 120),
+                    durationSec = obj.getInt("durationSec").coerceAtLeast(0),
                     status = SessionStatus.valueOf(obj.getString("status")),
                     completedSteps = obj.optInt("completedSteps", 0),
                     totalSteps = obj.optInt("totalSteps", 0)
