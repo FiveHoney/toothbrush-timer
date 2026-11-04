@@ -2,13 +2,16 @@ package com.example.toothtimer
 
 import kotlin.random.Random
 
-/** One independent random pause cue, followed by the existing zone announcements. */
-fun transitionAudio(
+/** Choose one pause sound; zone announcements belong to STEP, not BETWEEN_STEPS. */
+fun selectPauseCue(
     pauseCues: List<AudioCue>,
-    zoneCues: List<AudioCue>,
     stepIndex: Int,
     random: Random = Random.Default
-): List<AudioCue> {
-    val pauseCue = if (stepIndex > 0) pauseCues.randomOrNull(random) else null
-    return listOfNotNull(pauseCue) + zoneCues
-}
+): AudioCue? = if (stepIndex > 0) pauseCues.randomOrNull(random) else null
+
+fun phaseAudioUris(phase: CleaningPhase, pauseCueUri: String?, zoneCues: List<AudioCue>): List<String> =
+    when (phase) {
+        CleaningPhase.BETWEEN_STEPS -> listOfNotNull(pauseCueUri)
+        CleaningPhase.STEP -> zoneCues.map { it.uri }
+        CleaningPhase.COMPLETED -> emptyList()
+    }

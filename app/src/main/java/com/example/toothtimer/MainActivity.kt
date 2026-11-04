@@ -320,16 +320,16 @@ fun CleaningScreen(
     var session by rememberSaveable(stateSaver = clockSaver) { mutableStateOf(SessionClock(steps.map { it.durationSec * 1000L }, pauseBetweenZonesSec * 1000L)) }
     var isPaused by rememberSaveable { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
-    var audioFinished by remember { mutableStateOf(false) }
+    var pauseAudioFinished by remember { mutableStateOf(false) }
     var audioError by remember { mutableStateOf(false) }
     val audio = remember { CuePlayer(context) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val phase = session.phase
     val stepIndex = session.index
     val currentStep = steps[stepIndex]
-    // Choose once per transition. Keep that choice through pause/resume and recreation.
-    val transitionAudioUris = rememberSaveable(stepIndex) {
-        ArrayList(transitionAudio(pauseCues, currentStep.audioCues, stepIndex).map { it.uri })
+    // Only the pause sound delays the next zone. Keep its choice through recreation.
+    val pauseCueUri by rememberSaveable(stepIndex, key = "selected-pause-cue") {
+        mutableStateOf(selectPauseCue(pauseCues, stepIndex)?.uri)
     }
     val elapsedSec = (session.elapsedMs / 1000).toInt()
     val timeLeft = ceil(session.remainingMs / 1000.0).toInt()
@@ -353,14 +353,13 @@ fun CleaningScreen(
     val suspended = isPaused || showExitDialog
     LaunchedEffect(suspended) { audio.setPaused(suspended) }
     LaunchedEffect(phase, stepIndex) {
-        if (phase == CleaningPhase.BETWEEN_STEPS) {
-            audioFinished = false
-            audioError = false
-            for (uri in transitionAudioUris) {
-                if (!audio.play(uri)) audioError = true
-            }
-            audioFinished = true
+        audioError = false
+        if (phase == CleaningPhase.BETWEEN_STEPS) pauseAudioFinished = false
+        // STEP starts both the clock and its announcements; playback never gates STEP.
+        for (uri in phaseAudioUris(phase, pauseCueUri, currentStep.audioCues)) {
+            if (!audio.play(uri)) audioError = true
         }
+        if (phase == CleaningPhase.BETWEEN_STEPS) pauseAudioFinished = true
     }
     LaunchedEffect(suspended) {
         if (suspended) return@LaunchedEffect
@@ -369,9 +368,9 @@ fun CleaningScreen(
             val now = withFrameNanos { it }
             val delta = (now - previous) / 1_000_000
             previous += delta * 1_000_000
-            val next = session.advance(delta, audioFinished)
+            val next = session.advance(delta, pauseAudioFinished)
             // Reset before the next transition, so a previous playlist cannot unlock it.
-            if (next.index != session.index) audioFinished = false
+            if (next.index != session.index) pauseAudioFinished = false
             session = next
             if (next.phase == CleaningPhase.COMPLETED) {
                 onCompleted((next.elapsedMs / 1000).toInt())
@@ -437,8 +436,7 @@ fun CleaningScreen(
             )
             Spacer(Modifier.height(20.dp))
             TeethMap(activeZone = currentStep.zoneType, modifier = Modifier.fillMaxWidth().height(230.dp))
-            CircularTimer(value = pauseLeft, label = if (pauseLeft == 0 && !audioFinished) "озвучка…" else "переход", color = Color(0xFF2F76D2), progress = if (session.transitionMs == 0L) 1f else (session.phaseElapsedMs.toFloat() / session.transitionMs).coerceIn(0f, 1f))
-            if (audioError) Text("Запись недоступна — пропускаем её", color = Color(0xFFB3261E))
+            CircularTimer(value = pauseLeft, label = if (pauseLeft == 0 && !pauseAudioFinished) "озвучка…" else "переход", color = Color(0xFF2F76D2), progress = if (session.transitionMs == 0L) 1f else (session.phaseElapsedMs.toFloat() / session.transitionMs).coerceIn(0f, 1f))
             Spacer(Modifier.height(24.dp))
             Text("Следующая зона:", fontSize = 16.sp, color = Color.DarkGray)
             Text(
@@ -468,6 +466,7 @@ fun CleaningScreen(
 
         Spacer(Modifier.height(24.dp))
 
+        if (audioError) Text("Запись недоступна — пропускаем её", color = Color(0xFFB3261E))
         Text("Прогресс чистки • ${(progress * 100).toInt()}%", color = Color.DarkGray)
         ProgressBar(progress = progress)
 
@@ -708,7 +707,7 @@ fun SettingsScreen(
                 AudioCueControls(
                     cues = pauseCues,
                     title = "Звуки пауз между зонами",
-                    description = "В начале каждой паузы случайно выбирается один звук. Он прозвучит полностью, даже если время паузы уже вышло. Затем прозвучат подсказки следующей зоны, если они заданы.",
+                    description = "В начале каждой паузы случайно выбирается один звук. Он прозвучит полностью, даже если время паузы уже вышло. Озвучка следующей зоны начнётся вместе с её отсчётом.",
                     onSelectAudioCue = {
                         audioPickerForPause = true
                         audioPickerStepId = null
@@ -808,7 +807,7 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(28.dp))
                 Text(
-                    "Версия 1.2.0",
+                    "Версия 1.2.1",
                     modifier = Modifier.fillMaxWidth(),
                     textAlign = TextAlign.Center,
                     color = Color.Gray
@@ -894,8 +893,8 @@ fun AudioCueControls(
     cues: List<AudioCue>,
     onSelectAudioCue: () -> Unit,
     onRemoveAudioCue: (Int) -> Unit,
-    title: String = "Озвучка перехода к этой зоне",
-    description: String = "Записи звучат по очереди после случайного звука паузы. Чистка начнётся после всех записей и паузы."
+    title: String = "Озвучка зоны",
+    description: String = "Озвучка начинается вместе с отсчётом зоны. Если записей несколько, они звучат по очереди."
 ) {
     Column(Modifier.fillMaxWidth().padding(12.dp)) {
         Text(title, fontWeight = FontWeight.Bold)
