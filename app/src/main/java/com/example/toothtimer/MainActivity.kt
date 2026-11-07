@@ -3,8 +3,18 @@ package com.example.toothtimer
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.media.MediaPlayer
-import android.net.Uri
+import android.provider.OpenableColumns
+import android.view.WindowManager
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import kotlin.math.ceil
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -46,6 +56,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -53,29 +65,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.sin
+
+data class AudioCue(val uri: String, val name: String)
 
 data class CleaningStepConfig(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val durationSec: Int,
     val zoneType: ZoneType = ZoneType.CUSTOM,
-    val audioCueUri: String? = null
+    val audioCues: List<AudioCue> = emptyList()
 )
 
 enum class ZoneType {
@@ -105,6 +114,8 @@ enum class SessionStatus {
     INTERRUPTED
 }
 
+enum class AudioPickerTarget { ZONE, PAUSE, COMPLETION }
+
 enum class Screen {
     HOME,
     CLEANING,
@@ -133,18 +144,25 @@ fun ToothTimerApp() {
     val context = LocalContext.current
     val storage = remember { AppStorage(context) }
     val steps = remember { mutableStateListOf<CleaningStepConfig>().apply { addAll(storage.loadSteps()) } }
+    val pauseCues = remember { mutableStateListOf<AudioCue>().apply { addAll(storage.loadPauseCues()) } }
+    val completionCues = remember { mutableStateListOf<AudioCue>().apply { addAll(storage.loadCompletionCues()) } }
     val history = remember { mutableStateListOf<CleaningHistoryItem>().apply { addAll(storage.loadHistory()) } }
-    var currentScreen by remember { mutableStateOf(Screen.HOME) }
+    var currentScreen by rememberSaveable { mutableStateOf(Screen.HOME) }
 
+    var completionCueUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var startedAt by rememberSaveable { mutableStateOf(0L) }
+
+    BackHandler(enabled = currentScreen != Screen.HOME && currentScreen != Screen.CLEANING) { currentScreen = Screen.HOME }
     MaterialTheme {
         Surface(
             modifier = Modifier
                 .fillMaxSize()
+                .systemBarsPadding()
                 .background(Color.White)
         ) {
             when (currentScreen) {
                 Screen.HOME -> HomeScreen(
-                    onStart = { currentScreen = Screen.CLEANING },
+                    onStart = { completionCueUri = null; startedAt = System.currentTimeMillis(); currentScreen = Screen.CLEANING },
                     onHistory = { currentScreen = Screen.HISTORY },
                     onSettings = { currentScreen = Screen.SETTINGS }
                 )
@@ -152,9 +170,11 @@ fun ToothTimerApp() {
                 Screen.CLEANING -> CleaningScreen(
                     steps = steps,
                     pauseBetweenZonesSec = storage.loadPauseSec(),
+                    pauseCues = pauseCues,
                     onCompleted = { durationSec ->
+                        completionCueUri = selectCompletionCue(completionCues, SessionStatus.COMPLETED)?.uri
                         val item = CleaningHistoryItem(
-                            startedAtMillis = System.currentTimeMillis() - durationSec * 1000L,
+                            startedAtMillis = startedAt,
                             durationSec = durationSec,
                             status = SessionStatus.COMPLETED,
                             completedSteps = steps.size,
@@ -165,8 +185,9 @@ fun ToothTimerApp() {
                         currentScreen = Screen.DONE
                     },
                     onInterrupted = { durationSec, completedSteps ->
+                        completionCueUri = selectCompletionCue(completionCues, SessionStatus.INTERRUPTED)?.uri
                         val item = CleaningHistoryItem(
-                            startedAtMillis = System.currentTimeMillis() - durationSec * 1000L,
+                            startedAtMillis = startedAt,
                             durationSec = durationSec,
                             status = SessionStatus.INTERRUPTED,
                             completedSteps = completedSteps,
@@ -179,6 +200,7 @@ fun ToothTimerApp() {
                 )
 
                 Screen.DONE -> DoneScreen(
+                    completionCueUri = completionCueUri,
                     onHome = { currentScreen = Screen.HOME }
                 )
 
@@ -194,6 +216,18 @@ fun ToothTimerApp() {
                 Screen.SETTINGS -> SettingsScreen(
                     steps = steps,
                     pauseSec = storage.loadPauseSec(),
+                    pauseCues = pauseCues,
+                    completionCues = completionCues,
+                    onCompletionCuesChanged = { cues ->
+                        completionCues.clear()
+                        completionCues.addAll(cues)
+                        storage.saveCompletionCues(completionCues)
+                    },
+                    onPauseCuesChanged = { cues ->
+                        pauseCues.clear()
+                        pauseCues.addAll(cues)
+                        storage.savePauseCues(pauseCues)
+                    },
                     onBack = { currentScreen = Screen.HOME },
                     onStepsChanged = { storage.saveSteps(steps) },
                     onPauseChanged = { storage.savePauseSec(it) },
@@ -202,6 +236,10 @@ fun ToothTimerApp() {
                         steps.addAll(defaultSteps())
                         storage.saveSteps(steps)
                         storage.savePauseSec(2)
+                        pauseCues.clear()
+                        storage.savePauseCues(pauseCues)
+                        completionCues.clear()
+                        storage.saveCompletionCues(completionCues)
                     }
                 )
             }
@@ -275,6 +313,7 @@ fun HomeScreen(
 fun CleaningScreen(
     steps: List<CleaningStepConfig>,
     pauseBetweenZonesSec: Int,
+    pauseCues: List<AudioCue>,
     onCompleted: (durationSec: Int) -> Unit,
     onInterrupted: (durationSec: Int, completedSteps: Int) -> Unit
 ) {
@@ -285,84 +324,75 @@ fun CleaningScreen(
         return
     }
 
-    var phase by remember { mutableStateOf(CleaningPhase.STEP) }
-    var stepIndex by remember { mutableIntStateOf(0) }
-    var timeLeft by remember { mutableIntStateOf(steps[0].durationSec) }
-    var pauseLeft by remember { mutableIntStateOf(pauseBetweenZonesSec) }
-    var isPaused by remember { mutableStateOf(false) }
-    var elapsedSec by remember { mutableIntStateOf(0) }
-    var showExitDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
-    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
-
-    fun stopAudioCue() {
-        mediaPlayer?.runCatching {
-            stop()
-            release()
-        }
-        mediaPlayer = null
+    val clockSaver = remember {
+        listSaver<SessionClock, Long>(
+            save = { listOf(it.index.toLong(), it.phase.ordinal.toLong(), it.phaseElapsedMs, it.elapsedMs) },
+            restore = { SessionClock(steps.map { step -> step.durationSec * 1000L }, pauseBetweenZonesSec * 1000L,
+                it[0].toInt(), CleaningPhase.values()[it[1].toInt()], it[2], it[3]) }
+        )
     }
-
+    var session by rememberSaveable(stateSaver = clockSaver) { mutableStateOf(SessionClock(steps.map { it.durationSec * 1000L }, pauseBetweenZonesSec * 1000L)) }
+    var isPaused by rememberSaveable { mutableStateOf(false) }
+    var showExitDialog by remember { mutableStateOf(false) }
+    var pauseAudioFinished by remember { mutableStateOf(false) }
+    var audioError by remember { mutableStateOf(false) }
+    val audio = remember { CuePlayer(context) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val phase = session.phase
+    val stepIndex = session.index
     val currentStep = steps[stepIndex]
-    val totalDuration = steps.sumOf { it.durationSec } + pauseBetweenZonesSec * (steps.size - 1)
-    val progress = if (totalDuration > 0) elapsedSec.toFloat() / totalDuration.toFloat() else 0f
+    // Only the pause sound delays the next zone. Keep its choice through recreation.
+    val pauseCueUri by rememberSaveable(stepIndex, key = "selected-pause-cue") {
+        mutableStateOf(selectPauseCue(pauseCues, stepIndex)?.uri)
+    }
+    val zoneCueUri by rememberSaveable(stepIndex, key = "selected-zone-cue") {
+        mutableStateOf(selectRandomCue(currentStep.audioCues)?.uri)
+    }
+    val elapsedSec = (session.elapsedMs / 1000).toInt()
+    val timeLeft = ceil(session.remainingMs / 1000.0).toInt()
+    val pauseLeft = ceil((session.transitionMs - session.phaseElapsedMs).coerceAtLeast(0) / 1000.0).toInt()
+    val progress = session.cleaningProgress
 
-    LaunchedEffect(currentStep.id, phase) {
-        stopAudioCue()
-        if (phase == CleaningPhase.STEP) {
-            val audioUri = currentStep.audioCueUri
-            if (!audioUri.isNullOrBlank()) {
-                val player = MediaPlayer()
-                mediaPlayer = runCatching {
-                    player.apply {
-                        setDataSource(context, Uri.parse(audioUri))
-                        prepare()
-                        start()
-                    }
-                }.getOrElse {
-                    player.release()
-                    null
-                }
-            }
+    BackHandler { showExitDialog = true }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) { isPaused = true; audio.setPaused(true) }
+        }
+        lifecycle.addObserver(observer)
+        val window = (context as? android.app.Activity)?.window
+        window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose {
+            lifecycle.removeObserver(observer)
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            audio.close()
         }
     }
-
-    DisposableEffect(Unit) {
-        onDispose { stopAudioCue() }
-    }
-
-    LaunchedEffect(phase, stepIndex, isPaused) {
-        if (isPaused) return@LaunchedEffect
-
-        if (phase == CleaningPhase.STEP) {
-            while (timeLeft > 0 && !isPaused) {
-                delay(1000)
-                timeLeft -= 1
-                elapsedSec += 1
-            }
-
-            if (timeLeft <= 0 && !isPaused) {
-                if (stepIndex >= steps.lastIndex) {
-                    phase = CleaningPhase.COMPLETED
-                    onCompleted(elapsedSec)
-                } else {
-                    phase = CleaningPhase.BETWEEN_STEPS
-                    pauseLeft = pauseBetweenZonesSec
-                }
-            }
+    val suspended = isPaused || showExitDialog
+    LaunchedEffect(suspended) { audio.setPaused(suspended) }
+    LaunchedEffect(phase, stepIndex) {
+        audioError = false
+        if (phase == CleaningPhase.BETWEEN_STEPS) pauseAudioFinished = false
+        // STEP starts both the clock and its announcements; playback never gates STEP.
+        for (uri in phaseAudioUris(phase, pauseCueUri, zoneCueUri)) {
+            if (!audio.play(uri)) audioError = true
         }
-
-        if (phase == CleaningPhase.BETWEEN_STEPS) {
-            while (pauseLeft > 0 && !isPaused) {
-                delay(1000)
-                pauseLeft -= 1
-                elapsedSec += 1
-            }
-
-            if (pauseLeft <= 0 && !isPaused) {
-                stepIndex += 1
-                timeLeft = steps[stepIndex].durationSec
-                phase = CleaningPhase.STEP
+        if (phase == CleaningPhase.BETWEEN_STEPS) pauseAudioFinished = true
+    }
+    LaunchedEffect(suspended) {
+        if (suspended) return@LaunchedEffect
+        var previous = withFrameNanos { it }
+        while (true) {
+            val now = withFrameNanos { it }
+            val delta = (now - previous) / 1_000_000
+            previous += delta * 1_000_000
+            val next = session.advance(delta, pauseAudioFinished)
+            // Reset before the next transition, so a previous playlist cannot unlock it.
+            if (next.index != session.index) pauseAudioFinished = false
+            session = next
+            if (next.phase == CleaningPhase.COMPLETED) {
+                onCompleted((next.elapsedMs / 1000).toInt())
+                break
             }
         }
     }
@@ -375,7 +405,7 @@ fun CleaningScreen(
             confirmButton = {
                 TextButton(onClick = {
                     showExitDialog = false
-                    onInterrupted(elapsedSec, stepIndex)
+                    onInterrupted(elapsedSec, session.completedSteps)
                 }) {
                     Text("Завершить")
                 }
@@ -391,6 +421,7 @@ fun CleaningScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -422,11 +453,12 @@ fun CleaningScreen(
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(20.dp))
-            CircularTimer(value = pauseLeft, label = "секунды", color = Color(0xFF2F76D2))
+            TeethMap(activeZone = currentStep.zoneType, modifier = Modifier.fillMaxWidth().height(230.dp))
+            CircularTimer(value = pauseLeft, label = if (pauseLeft == 0 && !pauseAudioFinished) "озвучка…" else "переход", color = Color(0xFF2F76D2), progress = if (session.transitionMs == 0L) 1f else (session.phaseElapsedMs.toFloat() / session.transitionMs).coerceIn(0f, 1f))
             Spacer(Modifier.height(24.dp))
             Text("Следующая зона:", fontSize = 16.sp, color = Color.DarkGray)
             Text(
-                text = steps[stepIndex + 1].title,
+                text = currentStep.title,
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
@@ -447,11 +479,13 @@ fun CleaningScreen(
                     .height(230.dp)
             )
             Spacer(Modifier.height(18.dp))
-            CircularTimer(value = timeLeft, label = "секунд", color = Color(0xFF2F76D2))
+            CircularTimer(value = timeLeft, label = if (isPaused) "пауза" else "секунд", color = Color(0xFF2F76D2), progress = session.zoneProgress)
         }
 
         Spacer(Modifier.height(24.dp))
 
+        if (audioError) Text("Запись недоступна — пропускаем её", color = Color(0xFFB3261E))
+        Text("Прогресс чистки • ${(progress * 100).toInt()}%", color = Color.DarkGray)
         ProgressBar(progress = progress)
 
         Spacer(Modifier.height(24.dp))
@@ -479,7 +513,30 @@ fun CleaningScreen(
 }
 
 @Composable
-fun DoneScreen(onHome: () -> Unit) {
+fun DoneScreen(completionCueUri: String?, onHome: () -> Unit) {
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val audio = remember { CuePlayer(context) }
+    var audioFinished by rememberSaveable(completionCueUri, key = "completion-audio-finished") { mutableStateOf(false) }
+    var audioError by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycle, audio) {
+        audio.setPaused(!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> audio.setPaused(true)
+                Lifecycle.Event.ON_RESUME -> audio.setPaused(false)
+                else -> Unit
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer); audio.close() }
+    }
+    LaunchedEffect(completionCueUri) {
+        if (!audioFinished) {
+            if (completionCueUri != null) audioError = !audio.play(completionCueUri)
+            audioFinished = true
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -501,6 +558,7 @@ fun DoneScreen(onHome: () -> Unit) {
             fontSize = 18.sp,
             textAlign = TextAlign.Center
         )
+        if (audioError) Text("Звук завершения недоступен. Выберите файл заново в настройках.", color = Color(0xFFB3261E), textAlign = TextAlign.Center)
         Spacer(Modifier.height(40.dp))
         Button(
             onClick = onHome,
@@ -590,6 +648,10 @@ fun HistoryCard(item: CleaningHistoryItem) {
 fun SettingsScreen(
     steps: MutableList<CleaningStepConfig>,
     pauseSec: Int,
+    pauseCues: List<AudioCue>,
+    onPauseCuesChanged: (List<AudioCue>) -> Unit,
+    completionCues: List<AudioCue>,
+    onCompletionCuesChanged: (List<AudioCue>) -> Unit,
     onBack: () -> Unit,
     onStepsChanged: () -> Unit,
     onPauseChanged: (Int) -> Unit,
@@ -598,19 +660,31 @@ fun SettingsScreen(
     val context = LocalContext.current
     var currentPause by remember { mutableIntStateOf(pauseSec) }
     var showResetDialog by remember { mutableStateOf(false) }
-    var audioPickerStepIndex by remember { mutableStateOf<Int?>(null) }
-    val audioPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        val index = audioPickerStepIndex
-        audioPickerStepIndex = null
-        if (uri != null && index != null && index in steps.indices) {
-            runCatching {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
+    var audioPickerStepId by rememberSaveable { mutableStateOf<String?>(null) }
+    var audioPickerTarget by rememberSaveable(key = "audio-picker-target") { mutableStateOf(AudioPickerTarget.ZONE) }
+    val audioPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        val index = steps.indexOfFirst { it.id == audioPickerStepId }
+        val target = audioPickerTarget
+        audioPickerStepId = null
+        audioPickerTarget = AudioPickerTarget.ZONE
+        if (uris.isNotEmpty() && (target != AudioPickerTarget.ZONE || index >= 0)) {
+            val additions = uris.map { uri ->
+                runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                val name = runCatching {
+                    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                        if (it.moveToFirst()) it.getString(0) else null
+                    }
+                }.getOrNull() ?: "Аудиозапись"
+                AudioCue(uri.toString(), name)
             }
-            steps[index] = steps[index].copy(audioCueUri = uri.toString())
-            onStepsChanged()
+            when (target) {
+                AudioPickerTarget.PAUSE -> onPauseCuesChanged(pauseCues + additions)
+                AudioPickerTarget.COMPLETION -> onCompletionCuesChanged(completionCues + additions)
+                AudioPickerTarget.ZONE -> {
+                    steps[index] = steps[index].copy(audioCues = steps[index].audioCues + additions)
+                    onStepsChanged()
+                }
+            }
         }
     }
 
@@ -618,7 +692,7 @@ fun SettingsScreen(
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
             title = { Text("Сбросить настройки?") },
-            text = { Text("Список зон и пауза вернутся к значениям по умолчанию.") },
+            text = { Text("Зоны и пауза вернутся к значениям по умолчанию. Списки звуков пауз и завершения будут очищены.") },
             confirmButton = {
                 TextButton(onClick = {
                     showResetDialog = false
@@ -667,6 +741,7 @@ fun SettingsScreen(
                 Spacer(Modifier.height(8.dp))
                 CounterRow(
                     title = "Длительность паузы",
+                    increment = 1,
                     value = currentPause,
                     suffix = "сек",
                     min = 0,
@@ -674,6 +749,38 @@ fun SettingsScreen(
                     onChange = {
                         currentPause = it
                         onPauseChanged(it)
+                    }
+                )
+                AudioCueControls(
+                    cues = pauseCues,
+                    title = "Звуки пауз между зонами",
+                    description = "В начале каждой паузы случайно выбирается один звук. Он прозвучит полностью, даже если время паузы уже вышло. Озвучка следующей зоны начнётся вместе с её отсчётом.",
+                    onSelectAudioCue = {
+                        audioPickerTarget = AudioPickerTarget.PAUSE
+                        audioPickerStepId = null
+                        audioPickerLauncher.launch(arrayOf("audio/*"))
+                    },
+                    onRemoveAudioCue = { cueIndex ->
+                        onPauseCuesChanged(pauseCues.filterIndexed { index, _ -> index != cueIndex })
+                    }
+                )
+            }
+
+            item {
+                Divider()
+                Spacer(Modifier.height(8.dp))
+                Text("Завершение чистки", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                AudioCueControls(
+                    cues = completionCues,
+                    title = "Звук после полной чистки",
+                    description = "После последней зоны прозвучит один случайный файл из списка. При досрочном завершении звук не проигрывается.",
+                    onSelectAudioCue = {
+                        audioPickerTarget = AudioPickerTarget.COMPLETION
+                        audioPickerStepId = null
+                        audioPickerLauncher.launch(arrayOf("audio/*"))
+                    },
+                    onRemoveAudioCue = { cueIndex ->
+                        onCompletionCuesChanged(completionCues.filterIndexed { index, _ -> index != cueIndex })
                     }
                 )
             }
@@ -698,16 +805,21 @@ fun SettingsScreen(
                         steps[index] = step.copy(title = newTitle)
                         onStepsChanged()
                     },
+                    onZoneChange = { zone ->
+                        steps[index] = step.copy(zoneType = zone)
+                        onStepsChanged()
+                    },
                     onDurationChange = { newDuration ->
                         steps[index] = step.copy(durationSec = newDuration)
                         onStepsChanged()
                     },
                     onSelectAudioCue = {
-                        audioPickerStepIndex = index
+                        audioPickerTarget = AudioPickerTarget.ZONE
+                        audioPickerStepId = step.id
                         audioPickerLauncher.launch(arrayOf("audio/*"))
                     },
-                    onRemoveAudioCue = {
-                        steps[index] = step.copy(audioCueUri = null)
+                    onRemoveAudioCue = { cueIndex ->
+                        steps[index] = step.copy(audioCues = step.audioCues.filterIndexed { i, _ -> i != cueIndex })
                         onStepsChanged()
                     },
                     onMoveUp = {
@@ -761,7 +873,7 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(28.dp))
                 Text(
-                    "Версия 1.0.0",
+                    "Версия 1.3.0",
                     modifier = Modifier.fillMaxWidth(),
                     textAlign = TextAlign.Center,
                     color = Color.Gray
@@ -778,8 +890,9 @@ fun StepSettingsCard(
     step: CleaningStepConfig,
     onTitleChange: (String) -> Unit,
     onDurationChange: (Int) -> Unit,
+    onZoneChange: (ZoneType) -> Unit,
     onSelectAudioCue: () -> Unit,
-    onRemoveAudioCue: () -> Unit,
+    onRemoveAudioCue: (Int) -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onDelete: () -> Unit
@@ -819,8 +932,9 @@ fun StepSettingsCard(
 
             Spacer(Modifier.height(10.dp))
 
+            ZoneSelector(step.zoneType, onZoneChange)
             AudioCueControls(
-                hasAudioCue = !step.audioCueUri.isNullOrBlank(),
+                cues = step.audioCues,
                 onSelectAudioCue = onSelectAudioCue,
                 onRemoveAudioCue = onRemoveAudioCue
             )
@@ -842,35 +956,41 @@ fun StepSettingsCard(
 
 @Composable
 fun AudioCueControls(
-    hasAudioCue: Boolean,
+    cues: List<AudioCue>,
     onSelectAudioCue: () -> Unit,
-    onRemoveAudioCue: () -> Unit
+    onRemoveAudioCue: (Int) -> Unit,
+    title: String = "Озвучка зоны",
+    description: String = "В начале зоны случайно выбирается один файл из списка. Он запускается вместе с отсчётом."
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color.White, RoundedCornerShape(12.dp))
-            .padding(12.dp)
-    ) {
-        Text("Озвучка зоны", fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-        Button(
-            onClick = onSelectAudioCue,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Выбрать озвучку")
-        }
-        if (hasAudioCue) {
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = onRemoveAudioCue,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFD32F2F))
-            ) {
-                Text("Удалить озвучку")
+    Column(Modifier.fillMaxWidth().padding(12.dp)) {
+        Text(title, fontWeight = FontWeight.Bold)
+        Text(description, fontSize = 14.sp)
+        cues.forEachIndexed { index, cue ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("${index + 1}. ${cue.name}", modifier = Modifier.weight(1f))
+                TextButton(onClick = { onRemoveAudioCue(index) }) { Text("Удалить") }
             }
         }
+        Button(onClick = onSelectAudioCue, modifier = Modifier.fillMaxWidth()) { Text("Добавить аудиофайлы") }
     }
+}
+
+@Composable
+fun ZoneSelector(zone: ZoneType, onChange: (ZoneType) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    OutlinedButton(onClick = { expanded = true }) { Text("На схеме: ${zone.description()}") }
+    if (expanded) AlertDialog(
+        onDismissRequest = { expanded = false },
+        title = { Text("Область на схеме") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                ZoneType.values().forEach { value ->
+                    TextButton(onClick = { onChange(value); expanded = false }) { Text(value.description()) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { expanded = false }) { Text("Закрыть") } }
+    )
 }
 
 @Composable
@@ -880,7 +1000,8 @@ fun CounterRow(
     suffix: String,
     min: Int,
     max: Int,
-    onChange: (Int) -> Unit
+    onChange: (Int) -> Unit,
+    increment: Int = 5
 ) {
     Row(
         modifier = Modifier
@@ -890,33 +1011,33 @@ fun CounterRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(title, modifier = Modifier.weight(1f))
-        IconButton(onClick = { onChange((value - 5).coerceAtLeast(min)) }) {
+        IconButton(onClick = { onChange((value - increment).coerceAtLeast(min)) }) {
             Text("−", fontSize = 24.sp)
         }
         Text("$value $suffix", fontWeight = FontWeight.Bold, modifier = Modifier.width(72.dp), textAlign = TextAlign.Center)
-        IconButton(onClick = { onChange((value + 5).coerceAtMost(max)) }) {
+        IconButton(onClick = { onChange((value + increment).coerceAtMost(max)) }) {
             Text("+", fontSize = 24.sp)
         }
     }
 }
 
 @Composable
-fun CircularTimer(value: Int, label: String, color: Color) {
+fun CircularTimer(value: Int, label: String, color: Color, progress: Float) {
     Box(
         modifier = Modifier.size(150.dp),
         contentAlignment = Alignment.Center
     ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
+        Canvas(modifier = Modifier.fillMaxSize().padding(6.dp)) {
             drawCircle(
                 color = Color(0xFFE0E0E0),
-                style = Stroke(width = 12f)
+                style = Stroke(width = 6.dp.toPx(), cap = StrokeCap.Round)
             )
             drawArc(
                 color = color,
                 startAngle = -90f,
-                sweepAngle = 270f,
+                sweepAngle = 360f * progress.coerceIn(0f, 1f),
                 useCenter = false,
-                style = Stroke(width = 12f)
+                style = Stroke(width = 6.dp.toPx(), cap = StrokeCap.Round)
             )
         }
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -964,73 +1085,6 @@ fun ToothIcon(modifier: Modifier = Modifier) {
         drawCircle(Color.Black, radius = 5f, center = Offset(w * 0.40f, h * 0.42f))
         drawCircle(Color.Black, radius = 5f, center = Offset(w * 0.60f, h * 0.42f))
         drawArc(Color.Black, startAngle = 20f, sweepAngle = 140f, useCenter = false, topLeft = Offset(w * 0.38f, h * 0.47f), size = androidx.compose.ui.geometry.Size(w * 0.24f, h * 0.18f), style = Stroke(width = 5f))
-    }
-}
-
-@Composable
-fun TeethMap(activeZone: ZoneType, modifier: Modifier = Modifier) {
-    Canvas(modifier = modifier) {
-        val blue = Color(0xFF5A9BE8)
-        val gray = Color(0xFF222222)
-        val inactive = Color.White
-        val center = Offset(size.width / 2f, size.height / 2f)
-        val radiusX = size.width * 0.32f
-        val radiusY = size.height * 0.34f
-        val toothRadius = size.minDimension * 0.045f
-
-        val activeTop = when (activeZone) {
-            ZoneType.CHEW_TOP_RIGHT, ZoneType.OUTER_TOP_RIGHT -> setOf(0, 1, 2)
-            ZoneType.CHEW_TOP_LEFT, ZoneType.OUTER_TOP_LEFT -> setOf(7, 8, 9)
-            ZoneType.FRONT_TOP -> setOf(3, 4, 5, 6)
-            else -> emptySet()
-        }
-        val activeBottom = when (activeZone) {
-            ZoneType.CHEW_BOTTOM_RIGHT, ZoneType.OUTER_BOTTOM_RIGHT -> setOf(0, 1, 2)
-            ZoneType.CHEW_BOTTOM_LEFT, ZoneType.OUTER_BOTTOM_LEFT -> setOf(7, 8, 9)
-            ZoneType.FRONT_BOTTOM -> setOf(3, 4, 5, 6)
-            else -> emptySet()
-        }
-
-        fun drawTooth(pos: Offset, active: Boolean) {
-            drawCircle(
-                color = if (active) blue else inactive,
-                radius = toothRadius,
-                center = pos
-            )
-            drawCircle(
-                color = gray,
-                radius = toothRadius,
-                center = pos,
-                style = Stroke(width = 2.5f)
-            )
-        }
-
-        for (i in 0 until 10) {
-            val angle = PI + (i / 9.0) * PI
-            val x = center.x + cos(angle).toFloat() * radiusX
-            val y = center.y + sin(angle).toFloat() * radiusY - size.height * 0.07f
-            drawTooth(Offset(x, y), i in activeTop)
-        }
-
-        for (i in 0 until 10) {
-            val angle = 0.0 + (i / 9.0) * PI
-            val x = center.x + cos(angle).toFloat() * radiusX
-            val y = center.y + sin(angle).toFloat() * radiusY + size.height * 0.07f
-            drawTooth(Offset(x, y), i in activeBottom)
-        }
-
-        drawContext.canvas.nativeCanvas.apply {
-            drawText(
-                "схема зон",
-                center.x,
-                size.height - 12f,
-                android.graphics.Paint().apply {
-                    color = android.graphics.Color.GRAY
-                    textSize = 28f
-                    textAlign = android.graphics.Paint.Align.CENTER
-                }
-            )
-        }
     }
 }
 
@@ -1110,9 +1164,14 @@ class AppStorage(context: Context) {
                 CleaningStepConfig(
                     id = obj.optString("id", UUID.randomUUID().toString()),
                     title = obj.getString("title"),
-                    durationSec = obj.getInt("durationSec"),
+                    durationSec = obj.getInt("durationSec").coerceIn(5, 120),
                     zoneType = runCatching { ZoneType.valueOf(obj.optString("zoneType", "CUSTOM")) }.getOrDefault(ZoneType.CUSTOM),
-                    audioCueUri = obj.optNullableString("audioCueUri")
+                    audioCues = obj.optJSONArray("audioCues")?.let { cues ->
+                        List(cues.length()) { i ->
+                            val cue = cues.getJSONObject(i)
+                            AudioCue(cue.getString("uri"), cue.optString("name", "Аудиозапись"))
+                        }
+                    } ?: listOfNotNull(obj.optNullableString("audioCueUri")?.let { AudioCue(it, "Озвучка зоны") })
                 )
             }.ifEmpty { defaultSteps() }
         }.getOrDefault(defaultSteps())
@@ -1127,13 +1186,35 @@ class AppStorage(context: Context) {
                     .put("title", step.title)
                     .put("durationSec", step.durationSec)
                     .put("zoneType", step.zoneType.name)
-                    .put("audioCueUri", step.audioCueUri)
+                    .put("audioCues", JSONArray().apply { step.audioCues.forEach { put(JSONObject().put("uri", it.uri).put("name", it.name)) } })
             )
         }
         prefs.edit().putString("steps", array.toString()).apply()
     }
 
-    fun loadPauseSec(): Int = prefs.getInt("pauseSec", 2)
+    fun loadPauseCues(): List<AudioCue> = loadAudioCues("pauseAudioCues")
+    fun savePauseCues(cues: List<AudioCue>) = saveAudioCues("pauseAudioCues", cues)
+    fun loadCompletionCues(): List<AudioCue> = loadAudioCues("completionAudioCues")
+    fun saveCompletionCues(cues: List<AudioCue>) = saveAudioCues("completionAudioCues", cues)
+
+    private fun loadAudioCues(key: String): List<AudioCue> {
+        val raw = prefs.getString(key, null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            List(array.length()) { index ->
+                val cue = array.getJSONObject(index)
+                AudioCue(cue.getString("uri"), cue.optString("name", "Аудиозапись"))
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveAudioCues(key: String, cues: List<AudioCue>) {
+        val array = JSONArray()
+        cues.forEach { array.put(JSONObject().put("uri", it.uri).put("name", it.name)) }
+        prefs.edit().putString(key, array.toString()).apply()
+    }
+
+    fun loadPauseSec(): Int = prefs.getInt("pauseSec", 2).coerceIn(0, 30)
 
     fun savePauseSec(value: Int) {
         prefs.edit().putInt("pauseSec", value).apply()
@@ -1147,7 +1228,7 @@ class AppStorage(context: Context) {
                 val obj = array.getJSONObject(index)
                 CleaningHistoryItem(
                     startedAtMillis = obj.getLong("startedAtMillis"),
-                    durationSec = obj.getInt("durationSec"),
+                    durationSec = obj.getInt("durationSec").coerceAtLeast(0),
                     status = SessionStatus.valueOf(obj.getString("status")),
                     completedSteps = obj.optInt("completedSteps", 0),
                     totalSteps = obj.optInt("totalSteps", 0)
@@ -1171,3 +1252,4 @@ class AppStorage(context: Context) {
         prefs.edit().putString("history", array.toString()).apply()
     }
 }
+
