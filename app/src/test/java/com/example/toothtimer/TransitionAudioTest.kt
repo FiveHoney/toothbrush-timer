@@ -10,17 +10,17 @@ class TransitionAudioTest {
 
     @Test fun firstZoneStartsWithoutWaitingForItsAnnouncement() {
         assertNull(selectPauseCue(pool, 0, Random(1)))
-        assertTrue(phaseAudioUris(CleaningPhase.BETWEEN_STEPS, null, zone).isEmpty())
+        assertTrue(phaseAudioUris(CleaningPhase.BETWEEN_STEPS, null, zone.first().uri).isEmpty())
         val started = SessionClock(listOf(5000), 2000).advance(0, true)
         assertEquals(CleaningPhase.STEP, started.phase)
         assertEquals(5000L, started.remainingMs)
-        assertEquals(zone.map { it.uri }, phaseAudioUris(started.phase, null, zone))
+        assertEquals(listOf(zone.first().uri), phaseAudioUris(started.phase, null, zone.first().uri))
     }
 
     @Test fun emptyPoolDoesNotMoveZoneAudioIntoThePause() {
         assertNull(selectPauseCue(emptyList(), 1))
-        assertTrue(phaseAudioUris(CleaningPhase.BETWEEN_STEPS, null, zone).isEmpty())
-        assertEquals(zone.map { it.uri }, phaseAudioUris(CleaningPhase.STEP, null, zone))
+        assertTrue(phaseAudioUris(CleaningPhase.BETWEEN_STEPS, null, zone.first().uri).isEmpty())
+        assertEquals(listOf(zone.first().uri), phaseAudioUris(CleaningPhase.STEP, null, zone.first().uri))
     }
 
     @Test fun eachPauseGetsOneRandomCueAndNoZoneAnnouncements() {
@@ -28,7 +28,7 @@ class TransitionAudioTest {
         val selected = (1..100).map { index ->
             val cue = selectPauseCue(pool, index, random)!!
             assertTrue(cue in pool)
-            assertEquals(listOf(cue.uri), phaseAudioUris(CleaningPhase.BETWEEN_STEPS, cue.uri, zone))
+            assertEquals(listOf(cue.uri), phaseAudioUris(CleaningPhase.BETWEEN_STEPS, cue.uri, zone.first().uri))
             cue
         }
         assertEquals(pool.toSet(), selected.toSet())
@@ -43,13 +43,13 @@ class TransitionAudioTest {
         val transition = SessionClock(listOf(1000, 5000), 2000).advance(0, true).advance(1000, true)
         val expired = transition.advance(2000, false)
         assertEquals(CleaningPhase.BETWEEN_STEPS, expired.phase)
-        assertEquals(listOf(cue.uri), phaseAudioUris(expired.phase, cue.uri, zone))
+        assertEquals(listOf(cue.uri), phaseAudioUris(expired.phase, cue.uri, zone.first().uri))
         val stillPlaying = expired.advance(999, false)
         assertEquals(CleaningPhase.BETWEEN_STEPS, stillPlaying.phase)
         val nextZone = stillPlaying.advance(1, true)
         assertEquals(CleaningPhase.STEP, nextZone.phase)
         assertEquals(5000L, nextZone.remainingMs)
-        assertEquals(zone.map { it.uri }, phaseAudioUris(nextZone.phase, cue.uri, zone))
+        assertEquals(listOf(zone.first().uri), phaseAudioUris(nextZone.phase, cue.uri, zone.first().uri))
     }
 
     @Test fun zoneCountdownAdvancesAndFinishesWhileZoneAudioIsStillPlaying() {
@@ -62,7 +62,46 @@ class TransitionAudioTest {
         assertEquals(1, transition.index)
     }
 
-    @Test fun completionHasNoAudio() {
-        assertTrue(phaseAudioUris(CleaningPhase.COMPLETED, pool.first().uri, zone).isEmpty())
+    @Test fun cleaningScreenLeavesCompletionPlaybackToResultScreen() {
+        assertTrue(phaseAudioUris(CleaningPhase.COMPLETED, pool.first().uri, zone.first().uri).isEmpty())
+    }
+
+    @Test fun zoneChoosesOneVariantInsteadOfPlayingTheWholeList() {
+        val random = Random(34)
+        val selected = (1..100).map {
+            val cue = selectRandomCue(zone, random)!!
+            val uris = phaseAudioUris(CleaningPhase.STEP, pool.first().uri, cue.uri)
+            assertEquals(listOf(cue.uri), uris)
+            assertTrue(cue in zone)
+            cue
+        }
+        assertEquals(zone.toSet(), selected.toSet())
+    }
+
+    @Test fun completionChoosesOneVariantOnlyAfterFullCleaning() {
+        val random = Random(56)
+        val selected = (1..100).map {
+            val cue = selectCompletionCue(pool, SessionStatus.COMPLETED, random)!!
+            assertTrue(cue in pool)
+            cue
+        }
+        assertEquals(pool.toSet(), selected.toSet())
+    }
+
+    @Test fun interruptedCleaningDoesNotPlayCompletionCue() {
+        assertNull(selectCompletionCue(pool, SessionStatus.INTERRUPTED))
+    }
+
+    @Test fun emptyListsAreSilentInZonesAndAtCompletion() {
+        assertNull(selectRandomCue(emptyList()))
+        assertNull(selectCompletionCue(emptyList(), SessionStatus.COMPLETED))
+        assertTrue(phaseAudioUris(CleaningPhase.STEP, pool.first().uri, null).isEmpty())
+    }
+
+    @Test fun singleVariantAlwaysPlaysThatFile() {
+        repeat(10) {
+            assertEquals(zone.first(), selectRandomCue(zone.take(1)))
+            assertEquals(pool.first(), selectCompletionCue(pool.take(1), SessionStatus.COMPLETED))
+        }
     }
 }

@@ -114,6 +114,8 @@ enum class SessionStatus {
     INTERRUPTED
 }
 
+enum class AudioPickerTarget { ZONE, PAUSE, COMPLETION }
+
 enum class Screen {
     HOME,
     CLEANING,
@@ -143,9 +145,11 @@ fun ToothTimerApp() {
     val storage = remember { AppStorage(context) }
     val steps = remember { mutableStateListOf<CleaningStepConfig>().apply { addAll(storage.loadSteps()) } }
     val pauseCues = remember { mutableStateListOf<AudioCue>().apply { addAll(storage.loadPauseCues()) } }
+    val completionCues = remember { mutableStateListOf<AudioCue>().apply { addAll(storage.loadCompletionCues()) } }
     val history = remember { mutableStateListOf<CleaningHistoryItem>().apply { addAll(storage.loadHistory()) } }
     var currentScreen by rememberSaveable { mutableStateOf(Screen.HOME) }
 
+    var completionCueUri by rememberSaveable { mutableStateOf<String?>(null) }
     var startedAt by rememberSaveable { mutableStateOf(0L) }
 
     BackHandler(enabled = currentScreen != Screen.HOME && currentScreen != Screen.CLEANING) { currentScreen = Screen.HOME }
@@ -158,7 +162,7 @@ fun ToothTimerApp() {
         ) {
             when (currentScreen) {
                 Screen.HOME -> HomeScreen(
-                    onStart = { startedAt = System.currentTimeMillis(); currentScreen = Screen.CLEANING },
+                    onStart = { completionCueUri = null; startedAt = System.currentTimeMillis(); currentScreen = Screen.CLEANING },
                     onHistory = { currentScreen = Screen.HISTORY },
                     onSettings = { currentScreen = Screen.SETTINGS }
                 )
@@ -168,6 +172,7 @@ fun ToothTimerApp() {
                     pauseBetweenZonesSec = storage.loadPauseSec(),
                     pauseCues = pauseCues,
                     onCompleted = { durationSec ->
+                        completionCueUri = selectCompletionCue(completionCues, SessionStatus.COMPLETED)?.uri
                         val item = CleaningHistoryItem(
                             startedAtMillis = startedAt,
                             durationSec = durationSec,
@@ -180,6 +185,7 @@ fun ToothTimerApp() {
                         currentScreen = Screen.DONE
                     },
                     onInterrupted = { durationSec, completedSteps ->
+                        completionCueUri = selectCompletionCue(completionCues, SessionStatus.INTERRUPTED)?.uri
                         val item = CleaningHistoryItem(
                             startedAtMillis = startedAt,
                             durationSec = durationSec,
@@ -194,6 +200,7 @@ fun ToothTimerApp() {
                 )
 
                 Screen.DONE -> DoneScreen(
+                    completionCueUri = completionCueUri,
                     onHome = { currentScreen = Screen.HOME }
                 )
 
@@ -210,6 +217,12 @@ fun ToothTimerApp() {
                     steps = steps,
                     pauseSec = storage.loadPauseSec(),
                     pauseCues = pauseCues,
+                    completionCues = completionCues,
+                    onCompletionCuesChanged = { cues ->
+                        completionCues.clear()
+                        completionCues.addAll(cues)
+                        storage.saveCompletionCues(completionCues)
+                    },
                     onPauseCuesChanged = { cues ->
                         pauseCues.clear()
                         pauseCues.addAll(cues)
@@ -225,6 +238,8 @@ fun ToothTimerApp() {
                         storage.savePauseSec(2)
                         pauseCues.clear()
                         storage.savePauseCues(pauseCues)
+                        completionCues.clear()
+                        storage.saveCompletionCues(completionCues)
                     }
                 )
             }
@@ -331,6 +346,9 @@ fun CleaningScreen(
     val pauseCueUri by rememberSaveable(stepIndex, key = "selected-pause-cue") {
         mutableStateOf(selectPauseCue(pauseCues, stepIndex)?.uri)
     }
+    val zoneCueUri by rememberSaveable(stepIndex, key = "selected-zone-cue") {
+        mutableStateOf(selectRandomCue(currentStep.audioCues)?.uri)
+    }
     val elapsedSec = (session.elapsedMs / 1000).toInt()
     val timeLeft = ceil(session.remainingMs / 1000.0).toInt()
     val pauseLeft = ceil((session.transitionMs - session.phaseElapsedMs).coerceAtLeast(0) / 1000.0).toInt()
@@ -356,7 +374,7 @@ fun CleaningScreen(
         audioError = false
         if (phase == CleaningPhase.BETWEEN_STEPS) pauseAudioFinished = false
         // STEP starts both the clock and its announcements; playback never gates STEP.
-        for (uri in phaseAudioUris(phase, pauseCueUri, currentStep.audioCues)) {
+        for (uri in phaseAudioUris(phase, pauseCueUri, zoneCueUri)) {
             if (!audio.play(uri)) audioError = true
         }
         if (phase == CleaningPhase.BETWEEN_STEPS) pauseAudioFinished = true
@@ -495,7 +513,30 @@ fun CleaningScreen(
 }
 
 @Composable
-fun DoneScreen(onHome: () -> Unit) {
+fun DoneScreen(completionCueUri: String?, onHome: () -> Unit) {
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val audio = remember { CuePlayer(context) }
+    var audioFinished by rememberSaveable(completionCueUri, key = "completion-audio-finished") { mutableStateOf(false) }
+    var audioError by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycle, audio) {
+        audio.setPaused(!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> audio.setPaused(true)
+                Lifecycle.Event.ON_RESUME -> audio.setPaused(false)
+                else -> Unit
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer); audio.close() }
+    }
+    LaunchedEffect(completionCueUri) {
+        if (!audioFinished) {
+            if (completionCueUri != null) audioError = !audio.play(completionCueUri)
+            audioFinished = true
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -517,6 +558,7 @@ fun DoneScreen(onHome: () -> Unit) {
             fontSize = 18.sp,
             textAlign = TextAlign.Center
         )
+        if (audioError) Text("Звук завершения недоступен. Выберите файл заново в настройках.", color = Color(0xFFB3261E), textAlign = TextAlign.Center)
         Spacer(Modifier.height(40.dp))
         Button(
             onClick = onHome,
@@ -608,6 +650,8 @@ fun SettingsScreen(
     pauseSec: Int,
     pauseCues: List<AudioCue>,
     onPauseCuesChanged: (List<AudioCue>) -> Unit,
+    completionCues: List<AudioCue>,
+    onCompletionCuesChanged: (List<AudioCue>) -> Unit,
     onBack: () -> Unit,
     onStepsChanged: () -> Unit,
     onPauseChanged: (Int) -> Unit,
@@ -617,13 +661,13 @@ fun SettingsScreen(
     var currentPause by remember { mutableIntStateOf(pauseSec) }
     var showResetDialog by remember { mutableStateOf(false) }
     var audioPickerStepId by rememberSaveable { mutableStateOf<String?>(null) }
-    var audioPickerForPause by rememberSaveable { mutableStateOf(false) }
+    var audioPickerTarget by rememberSaveable(key = "audio-picker-target") { mutableStateOf(AudioPickerTarget.ZONE) }
     val audioPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val index = steps.indexOfFirst { it.id == audioPickerStepId }
-        val forPause = audioPickerForPause
+        val target = audioPickerTarget
         audioPickerStepId = null
-        audioPickerForPause = false
-        if (uris.isNotEmpty() && (forPause || index >= 0)) {
+        audioPickerTarget = AudioPickerTarget.ZONE
+        if (uris.isNotEmpty() && (target != AudioPickerTarget.ZONE || index >= 0)) {
             val additions = uris.map { uri ->
                 runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
                 val name = runCatching {
@@ -633,10 +677,13 @@ fun SettingsScreen(
                 }.getOrNull() ?: "Аудиозапись"
                 AudioCue(uri.toString(), name)
             }
-            if (forPause) onPauseCuesChanged(pauseCues + additions)
-            else {
-                steps[index] = steps[index].copy(audioCues = steps[index].audioCues + additions)
-                onStepsChanged()
+            when (target) {
+                AudioPickerTarget.PAUSE -> onPauseCuesChanged(pauseCues + additions)
+                AudioPickerTarget.COMPLETION -> onCompletionCuesChanged(completionCues + additions)
+                AudioPickerTarget.ZONE -> {
+                    steps[index] = steps[index].copy(audioCues = steps[index].audioCues + additions)
+                    onStepsChanged()
+                }
             }
         }
     }
@@ -645,7 +692,7 @@ fun SettingsScreen(
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
             title = { Text("Сбросить настройки?") },
-            text = { Text("Зоны и пауза вернутся к значениям по умолчанию. Список звуков пауз будет очищен.") },
+            text = { Text("Зоны и пауза вернутся к значениям по умолчанию. Списки звуков пауз и завершения будут очищены.") },
             confirmButton = {
                 TextButton(onClick = {
                     showResetDialog = false
@@ -709,12 +756,31 @@ fun SettingsScreen(
                     title = "Звуки пауз между зонами",
                     description = "В начале каждой паузы случайно выбирается один звук. Он прозвучит полностью, даже если время паузы уже вышло. Озвучка следующей зоны начнётся вместе с её отсчётом.",
                     onSelectAudioCue = {
-                        audioPickerForPause = true
+                        audioPickerTarget = AudioPickerTarget.PAUSE
                         audioPickerStepId = null
                         audioPickerLauncher.launch(arrayOf("audio/*"))
                     },
                     onRemoveAudioCue = { cueIndex ->
                         onPauseCuesChanged(pauseCues.filterIndexed { index, _ -> index != cueIndex })
+                    }
+                )
+            }
+
+            item {
+                Divider()
+                Spacer(Modifier.height(8.dp))
+                Text("Завершение чистки", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                AudioCueControls(
+                    cues = completionCues,
+                    title = "Звук после полной чистки",
+                    description = "После последней зоны прозвучит один случайный файл из списка. При досрочном завершении звук не проигрывается.",
+                    onSelectAudioCue = {
+                        audioPickerTarget = AudioPickerTarget.COMPLETION
+                        audioPickerStepId = null
+                        audioPickerLauncher.launch(arrayOf("audio/*"))
+                    },
+                    onRemoveAudioCue = { cueIndex ->
+                        onCompletionCuesChanged(completionCues.filterIndexed { index, _ -> index != cueIndex })
                     }
                 )
             }
@@ -748,7 +814,7 @@ fun SettingsScreen(
                         onStepsChanged()
                     },
                     onSelectAudioCue = {
-                        audioPickerForPause = false
+                        audioPickerTarget = AudioPickerTarget.ZONE
                         audioPickerStepId = step.id
                         audioPickerLauncher.launch(arrayOf("audio/*"))
                     },
@@ -807,7 +873,7 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(28.dp))
                 Text(
-                    "Версия 1.2.1",
+                    "Версия 1.3.0",
                     modifier = Modifier.fillMaxWidth(),
                     textAlign = TextAlign.Center,
                     color = Color.Gray
@@ -894,7 +960,7 @@ fun AudioCueControls(
     onSelectAudioCue: () -> Unit,
     onRemoveAudioCue: (Int) -> Unit,
     title: String = "Озвучка зоны",
-    description: String = "Озвучка начинается вместе с отсчётом зоны. Если записей несколько, они звучат по очереди."
+    description: String = "В начале зоны случайно выбирается один файл из списка. Он запускается вместе с отсчётом."
 ) {
     Column(Modifier.fillMaxWidth().padding(12.dp)) {
         Text(title, fontWeight = FontWeight.Bold)
@@ -1126,8 +1192,13 @@ class AppStorage(context: Context) {
         prefs.edit().putString("steps", array.toString()).apply()
     }
 
-    fun loadPauseCues(): List<AudioCue> {
-        val raw = prefs.getString("pauseAudioCues", null) ?: return emptyList()
+    fun loadPauseCues(): List<AudioCue> = loadAudioCues("pauseAudioCues")
+    fun savePauseCues(cues: List<AudioCue>) = saveAudioCues("pauseAudioCues", cues)
+    fun loadCompletionCues(): List<AudioCue> = loadAudioCues("completionAudioCues")
+    fun saveCompletionCues(cues: List<AudioCue>) = saveAudioCues("completionAudioCues", cues)
+
+    private fun loadAudioCues(key: String): List<AudioCue> {
+        val raw = prefs.getString(key, null) ?: return emptyList()
         return runCatching {
             val array = JSONArray(raw)
             List(array.length()) { index ->
@@ -1137,10 +1208,10 @@ class AppStorage(context: Context) {
         }.getOrDefault(emptyList())
     }
 
-    fun savePauseCues(cues: List<AudioCue>) {
+    private fun saveAudioCues(key: String, cues: List<AudioCue>) {
         val array = JSONArray()
         cues.forEach { array.put(JSONObject().put("uri", it.uri).put("name", it.name)) }
-        prefs.edit().putString("pauseAudioCues", array.toString()).apply()
+        prefs.edit().putString(key, array.toString()).apply()
     }
 
     fun loadPauseSec(): Int = prefs.getInt("pauseSec", 2).coerceIn(0, 30)
